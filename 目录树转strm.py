@@ -20,7 +20,7 @@ except NameError:
     # 备用方案 (例如在某些打包环境中 __file__ 未定义)
     script_dir = os.getcwd()
 
-# 配置文件 (保存UI设置)
+# 配置文件
 CONFIG_FILE = os.path.join(script_dir, 'config.json')
 
 # 媒体文件扩展名过滤
@@ -1014,3 +1014,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
