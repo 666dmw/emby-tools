@@ -11,76 +11,60 @@ from tkinter import filedialog, scrolledtext, messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- 全局常量 ---
-
-# 定位脚本的真实目录，确保配置文件路径始终正确
+# 基础设置
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 except NameError:
-    # 备用方案 (例如在某些打包环境中 __file__ 未定义)
     script_dir = os.getcwd()
 
-# 配置文件
 CONFIG_FILE = os.path.join(script_dir, 'config.json')
 
-# 媒体文件扩展名过滤
-VIDEO_EXTS = ['.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.rmvb']
+# 视频格式过滤
+VIDEO_EXTS = ['.mp4', '.mkv', '.avi', '.mov', '.flv', '.ts', '.rmvb', '.iso', '.wmv']
+
+# 预编译正则
+TREE_LINE_PATTERN = re.compile(r'^([| ]+)[|\\/\-]+(.*)')
 
 def trim_path_by_keyword(path, keyword):
     """
-    以 keyword 为开始标志，截取 path 中 keyword 及其之后的部分。
-    返回以 / 开头的标准化相对路径。
+    正则太慢，改用字符串 find 截取，几万个文件也能秒解。
     """
-    if not keyword:
-        p = path.replace('\\', '/')
-        p = '/' + p.lstrip('/')
-        while p.startswith('//'):
-            p = p[1:]
-        return p
-
-    keyword = keyword.replace('\\', '/')
-    path = path.replace('\\', '/')
-
-    # 使用 re.escape 确保关键词中的特殊字符被正确匹配
-    # re.search 从任意位置开始匹配
-    match = re.search(re.escape(keyword), path, re.IGNORECASE) 
+    p = path.replace('\\', '/')
     
-    if match:
-        pos = match.start()
-        sub = path[pos:]
+    if not keyword:
+        return '/' + p.lstrip('/')
+
+    # 转小写定位
+    idx = p.lower().find(keyword.replace('\\', '/').lower())
+
+    if idx != -1:
+        sub = p[idx:]
         if not sub.startswith('/'):
             sub = '/' + sub
-        while sub.startswith('//'):
-            sub = sub[1:]
+        while '//' in sub:
+            sub = sub.replace('//', '/')
         return sub
     else:
-        # 如果找不到关键词，则返回完整的标准化路径
-        p = '/' + path.lstrip('/')
-        while p.startswith('//'):
-            p = p[1:]
-        return p
+        return '/' + p.lstrip('/')
 
 class StrmGeneratorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("115 目录树转 STRM 工具 (优化版)")
+        self.root.title("115 目录树转 STRM 工具 (极速版)")
         self.root.geometry("960x720") 
         
-        # 缓存解析结果
         self.all_media_paths = []
         self.folder_choices = set()
-        
         self.selected_folders = set()
-        self.last_mode = None # 保存最后选择的模式
+        self.last_mode = None 
         
-        # 线程锁，防止加载/生成时冲突
         self._is_loading = threading.Lock()
         
         self.create_widgets()
         self.load_config()
 
     def create_widgets(self):
-        # --- 1. 配置框架 (Top) ---
+        # 1. 配置区
         frame = tk.LabelFrame(self.root, text="🚀 基本配置", padx=10, pady=10)
         frame.pack(side='top', padx=10, pady=10, fill='x')
 
@@ -110,49 +94,78 @@ class StrmGeneratorApp:
         tk.Entry(frame, textvariable=self.ext_var, width=10).grid(row=4, column=1, sticky='w', padx=5)
 
         self.encode_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(frame, text="链接自动 URL 编码", variable=self.encode_var).grid(row=4, column=1, sticky='e', padx=(0, 150)) 
+        tk.Checkbutton(frame, text="链接自动 URL 编码", variable=self.encode_var).grid(row=4, column=1, padx=(120, 0), sticky='w') 
         
+        # 自动载入开关
+        self.auto_load_latest_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame, text="自动载入同目录最新文件", variable=self.auto_load_latest_var, fg='blue').grid(row=4, column=1, sticky='e', padx=(0, 10))
+
         self.save_var = tk.BooleanVar(value=True)
         tk.Checkbutton(frame, text="保存设置", variable=self.save_var).grid(row=4, column=2, sticky='w')
 
-        # 确保路径输入框可以拉伸
         frame.grid_columnconfigure(1, weight=1)
 
-        # --- 2. 操作按钮 (Middle) ---
+        # 2. 按钮区
         btn_frame = tk.LabelFrame(self.root, text="🔨 操作模式", padx=10, pady=6)
         btn_frame.pack(side='top', pady=6, fill='x', padx=10)
 
-        # 按钮平铺
         tk.Button(btn_frame, text="📂 载入目录树 (第一步)", width=20, command=self.load_tree_only).pack(side='left', padx=6, expand=True)
         tk.Button(btn_frame, text="🔥 全量生成", width=20, fg='red', command=self.confirm_and_start_full_generation).pack(side='left', padx=6, expand=True)
         tk.Button(btn_frame, text="🔄 增量生成", width=20, command=lambda: self.start_generation(mode='increment')).pack(side='left', padx=6, expand=True)
         tk.Button(btn_frame, text="✅ 选择目录生成", width=20, command=self.show_folder_selector).pack(side='left', padx=6, expand=True)
 
-        # --- 3. 布局 (Top/Bottom/Fill) ---
-        
-        # 状态栏 (Bottom)
+        # 3. 日志区
         self.status_var = tk.StringVar(value="✅ 等待开始...")
         tk.Label(self.root, textvariable=self.status_var, anchor='w', fg='blue', font=('Arial', 10, 'bold')).pack(side='bottom', fill='x', padx=10, pady=5)
 
-        # 日志输出 (Fill)
         tk.Label(self.root, text="📜 日志输出：").pack(side='top', anchor='w', padx=10)
-        
         self.log_text = scrolledtext.ScrolledText(self.root, width=120, height=28)
         self.log_text.pack(side='top', padx=10, pady=5, fill='both', expand=True) 
+        self.log_text.config(state='disabled')
         
-        self.log_text.config(state='disabled') # 设为只读
-        
-        # 日志区域也支持拖放
         self.log_text.drop_target_register(DND_FILES)
         self.log_text.dnd_bind('<<Drop>>', self.on_drop_files)
 
-    # --- UI 辅助方法 ---
+    # 找同目录下最新的文件
+    def _find_latest_file(self, current_file_path):
+        if not current_file_path: return None
+        directory = os.path.dirname(current_file_path)
+        if not os.path.exists(directory): return None
+
+        _, ext = os.path.splitext(current_file_path)
+        ext = ext.lower()
+
+        # glob 对括号等特殊字符支持不好，直接用 listdir
+        try:
+            all_files = os.listdir(directory)
+        except Exception:
+            return None
+
+        candidates = []
+        for f in all_files:
+            if f.lower().endswith(ext):
+                full_path = os.path.join(directory, f)
+                if os.path.isfile(full_path):
+                    candidates.append(full_path)
+        
+        if not candidates: return None
+            
+        # 文件名带时间戳，直接按文件名倒序排最准
+        candidates.sort(key=lambda x: os.path.basename(x), reverse=True)
+        
+        latest_file = candidates[0]
+        
+        if os.path.normpath(latest_file) != os.path.normpath(current_file_path):
+            return latest_file
+        return None
+
+    # UI 回调
     def browse_file(self):
         path = filedialog.askopenfilename(filetypes=[("文本文件", "*.txt")])
         if path:
             self.path_var.set(path)
             self.save_config()
-            self.load_tree_only() # 异步加载
+            self.load_tree_only() 
 
     def browse_output(self):
         folder = filedialog.askdirectory()
@@ -161,52 +174,43 @@ class StrmGeneratorApp:
             self.save_config()
 
     def on_drop_files(self, event):
-        # 清理 Windows 拖放时可能带入的花括号
         try:
             files_raw = self.root.tk.splitlist(event.data)
             files = [f.strip('{}') for f in files_raw]
         except Exception:
-            files = [event.data] # 备用方案
+            files = [event.data]
 
         valid_txt_files = [f for f in files if f.lower().endswith('.txt')]
         
         if valid_txt_files:
-            dropped_file = valid_txt_files[0] # 只取第一个
+            dropped_file = valid_txt_files[0]
             self.path_var.set(dropped_file)
             self.log(f"[拖入] 已设置目录树文件: {dropped_file}")
             self.save_config() 
-            self.load_tree_only() # 异步加载
+            self.load_tree_only() 
         else:
             self.log("[拖入] 拖入的文件不是 .txt 文件。")
 
-
     def log(self, text):
-        """线程安全的日志记录 (智能滚动, 只读)"""
         if threading.current_thread() is threading.main_thread():
             is_at_bottom = True 
             try:
-                # 检查滚动条是否在底部
                 scroll_y = self.log_text.yview() 
                 is_at_bottom = scroll_y[1] > 0.99
             except tk.TclError:
-                # 窗口尚未完全初始化时，yview() 可能会失败
                 pass
             
-            # 临时启用控件以写入日志
             self.log_text.config(state='normal')
-            
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             self.log_text.insert(tk.END, f"[{ts}] {text}\n")
             
             if is_at_bottom:
-                self.log_text.see(tk.END) # 仅在已到底部时才自动滚动
-            
+                self.log_text.see(tk.END)
             self.log_text.config(state='disabled')
         else:
-            # 在工作线程中，调度回主线程
             self.root.after(0, self.log, text)
 
-    # --- 配置加载与保存 ---
+    # 读写配置
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
             try:
@@ -218,12 +222,12 @@ class StrmGeneratorApp:
                 self.ext_var.set(config.get('ext', '.strm'))
                 self.start_keyword_var.set(config.get('start_keyword', ''))
                 self.save_var.set(config.get('save_config', True))
+                self.auto_load_latest_var.set(config.get('auto_load_latest', True))
                 self.log(f"[配置] 成功加载配置文件: {CONFIG_FILE}")
             except Exception as e:
                 self.log(f"[错误] 配置文件 {CONFIG_FILE} 读取失败: {e}")
         else:
             self.log("[配置] 未找到配置文件，使用默认设置。")
-
 
     def save_config(self, mode=None):
         if self.save_var.get():
@@ -234,7 +238,8 @@ class StrmGeneratorApp:
                 'ext': self.ext_var.get(),
                 'start_keyword': self.start_keyword_var.get(),
                 'last_mode': mode or self.last_mode,
-                'save_config': self.save_var.get()
+                'save_config': self.save_var.get(),
+                'auto_load_latest': self.auto_load_latest_var.get()
             }
             try:
                 with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -242,34 +247,22 @@ class StrmGeneratorApp:
             except Exception as e:
                 self.log(f"[错误] 保存配置 {CONFIG_FILE} 失败: {e}")
         elif os.path.exists(CONFIG_FILE):
-            # 如果取消勾选“保存设置”，则删除配置文件
             try:
                 os.remove(CONFIG_FILE)
-            except Exception as e:
-                self.log(f"[警告] 删除配置文件 {CONFIG_FILE} 失败: {e}")
+            except Exception:
+                pass
 
     def _backup_index_file(self, index_file_path):
-        """
-        创建索引文件的备份 (.bak)，并保存在脚本 (script_dir) 目录下。
-        """
-        if not os.path.exists(index_file_path):
-            return  # 没有可备份的文件
-
+        if not os.path.exists(index_file_path): return
         try:
-            # 备份到脚本目录，而不是输出目录
-            index_filename = os.path.basename(index_file_path)
-            backup_filename = index_filename + ".bak"
-            backup_file_path = os.path.join(script_dir, backup_filename) 
-
-            # copy2 会覆盖旧的备份
-            shutil.copy2(index_file_path, backup_file_path)
-            self.log(f"[索引] 已备份当前索引文件到: {backup_file_path}")
+            backup_path = os.path.join(script_dir, os.path.basename(index_file_path) + ".bak")
+            shutil.copy2(index_file_path, backup_path)
+            self.log(f"[索引] 已备份当前索引文件到: {backup_path}")
         except Exception as e:
             self.log(f"[错误] 备份索引文件失败: {e}")
 
-    # --- 核心逻辑：目录树解析 ---
+    # 解析部分
     def read_text_file_with_fallback(self, path):
-        # 尝试多种可能的编码
         for enc in ['utf-8', 'utf-16', 'utf-8-sig', 'gb18030', 'gbk']:
             try:
                 with open(path, 'r', encoding=enc) as f:
@@ -279,10 +272,6 @@ class StrmGeneratorApp:
         raise UnicodeDecodeError("read", b"", 0, 1, "文件编码错误，建议另存为 UTF-8")
 
     def parse_directory_tree(self, lines):
-        """
-        解析目录树文本，返回媒体文件的逻辑路径列表。
-        使用 VIDEO_EXTS 进行过滤。
-        """
         paths = []
         stack = []
         processing = False
@@ -293,69 +282,60 @@ class StrmGeneratorApp:
 
         for line in lines:
             line = line.rstrip('\n\r')
-            if not line.strip():
-                continue
+            if not line.strip(): continue
             
-            # 如果设置了关键词，则跳过直到找到它
             if start_keyword and not processing:
-                # 使用关键词匹配开始处理
                 if start_keyword in line:
-                    stack = [] # 找到关键词，重置堆栈并开始处理
+                    stack = [] 
                     processing = True
                 continue 
             
-            if not processing:
-                continue
+            if not processing: continue
 
-            # 匹配目录树结构：开头是 | 或空格，后面是 |/\- 字符
-            match = re.match(r'^([| ]+)[|\\/\-]+(.*)', line)
+            match = TREE_LINE_PATTERN.match(line)
             if match:
                 prefix = match.group(1)
                 name = match.group(2).strip()
-                # 使用 | 的数量来估计深度，忽略空格
                 depth = len(prefix.replace(' ', ''))
                 
-                # 栈操作，保持目录路径
                 while len(stack) > depth:
                     stack.pop()
 
-                # 兼容可能的跳级目录（例如深度0直接到深度2）
                 if len(stack) <= depth:
-                    # 确保 stack 达到 depth
                     while len(stack) < depth:
-                        stack.append("") # 填充空项，用于表示未记录的中间目录
-                    
+                        stack.append("") 
                     if stack and len(stack) == depth:
-                        # 替换当前深度的最后一项
                         stack[-1] = name
-                    else: # 针对 depth=0 的情况或结构异常
+                    else: 
                         stack.append(name)
 
-                full_path = '/'.join([p for p in stack if p]) # 移除路径中的空项，但只影响最终路径
+                full_path = '/'.join([p for p in stack if p])
                 
-                # 检查是否为媒体文件
-                is_media_file = any(name.lower().endswith(ext) for ext in VIDEO_EXTS)
-                is_file_like = '.' in name.rsplit('/', 1)[-1] # 简单的文件判断，防止目录被误判为文件
+                lower_name = name.lower()
+                is_media = False
+                for ext in VIDEO_EXTS:
+                    if lower_name.endswith(ext):
+                        is_media = True
+                        break
                 
-                if is_media_file and is_file_like:
+                if is_media and '.' in name.rsplit('/', 1)[-1]:
                     paths.append(full_path)
             
-            # 处理根目录或没有前缀的特殊情况
             elif processing and '|' not in line and '-' not in line:
-                # 尝试将没有目录树符号的行视为根目录下的项
                 name = line.strip()
                 if name:
-                    is_media_file = any(name.lower().endswith(ext) for ext in VIDEO_EXTS)
-                    if is_media_file and not stack:
+                    lower_name = name.lower()
+                    is_media = False
+                    for ext in VIDEO_EXTS:
+                        if lower_name.endswith(ext):
+                            is_media = True
+                            break
+                    if is_media and not stack:
                         paths.append(name)
         return paths
 
-    # --- 核心逻辑：异步加载 ---
+    # 载入线程
     def _load_tree_blocking(self):
-        """
-        实际的 I/O 和解析 (在工作线程中运行)。
-        成功时返回 (all_media_paths, folder_set)，失败时返回 None。
-        """
         input_path = self.path_var.get()
         if not input_path or not os.path.exists(input_path):
             self.log("[错误] 载入失败：目录树文件路径无效。")
@@ -366,9 +346,7 @@ class StrmGeneratorApp:
             lines = self.read_text_file_with_fallback(input_path) 
             all_media_paths = self.parse_directory_tree(lines)
             
-            # 获取所有唯一的目录名
             folder_set = sorted(set(os.path.dirname(p) for p in all_media_paths if os.path.dirname(p)))
-            # 如果存在根目录文件，则添加一个空字符串代表根目录
             if any(not os.path.dirname(p) for p in all_media_paths):
                  folder_set.insert(0, "") 
                  
@@ -379,211 +357,140 @@ class StrmGeneratorApp:
             self.root.after(0, lambda: self.status_var.set("❌ 解析失败！请检查文件编码或格式。"))
             return None
 
-
     def load_tree_only(self, callback=None):
-        """
-        异步加载目录树 (UI 线程调用)。
-        使用锁 _is_loading 防止并发操作。
-        """
         if not self._is_loading.acquire(blocking=False):
             self.log("[提示] 正在处理中，请稍候...")
-            if callback:
-                self.root.after(0, lambda: callback(False))
+            if callback: self.root.after(0, lambda: callback(False))
             return
+
+        # 检查有没有新文件
+        if self.auto_load_latest_var.get():
+            current_path = self.path_var.get()
+            latest_path = self._find_latest_file(current_path)
+            if latest_path:
+                latest_filename = os.path.basename(latest_path)
+                if os.path.normpath(current_path) != os.path.normpath(latest_path):
+                    self.log(f"检测到更新的目录树文件，已自动切换为 {latest_filename}")
+                    self.path_var.set(latest_path)
 
         self.root.after(0, lambda: self.status_var.set("🔄 正在载入目录树..."))
         
         def worker():
             try:
                 results = self._load_tree_blocking()
-                
                 if results is None:
-                    # 捕获加载失败
-                    if callback:
-                        self.root.after(0, lambda: callback(False))
+                    if callback: self.root.after(0, lambda: callback(False))
                     return
                 
                 all_media_paths, folder_set = results
 
-                # 成功 - 调度UI更新
-                def update_ui_with_load_results():
+                def update_ui():
                     self.all_media_paths = all_media_paths
                     self.folder_choices = set(folder_set)
-                    self.selected_folders = set() # 清空上次的选择
+                    self.selected_folders = set() 
                     
                     self.log(f"[载入] 成功解析 {len(self.all_media_paths)} 个媒体文件，{len(folder_set)} 个文件夹。")
                     self.status_var.set(f"✅ 目录树载入完成，共 {len(self.all_media_paths)} 个文件。")
-                    if callback:
-                        callback(True)
+                    if callback: callback(True)
 
-                self.root.after(0, update_ui_with_load_results)
+                self.root.after(0, update_ui)
 
             except Exception as e:
-                # 捕获意外错误
-                def log_load_error():
+                def log_err():
                     self.log(f"[错误] 载入目录树时发生意外: {e}")
                     self.log(traceback.format_exc())
                     self.status_var.set("❌ 载入失败！请检查日志。")
-                    if callback:
-                        callback(False)
-                self.root.after(0, log_load_error)
+                    if callback: callback(False)
+                self.root.after(0, log_err)
             finally:
-                # 确保锁总是被释放
                 self._is_loading.release()
         
         t = threading.Thread(target=worker, daemon=True)
         t.start()
 
-
-    # --- 核心逻辑：文件夹选择窗口 ---
+    # 目录多选窗
     def show_folder_selector(self):
-        # 1. 检查缓存，如果为空则异步加载
         if not self.folder_choices:
             self.log("[提示] 文件夹列表为空，正在尝试自动载入...")
-            
-            def on_load_complete(success):
-                if success and self.folder_choices:
-                    self.show_folder_selector() # 重新调用
-                elif not success:
-                    self.log("[错误] 自动载入失败，无法打开目录选择器。")
-                else:
-                    self.log("[错误] 无法载入文件夹列表。请检查目录树文件。")
-            
-            self.load_tree_only(callback=on_load_complete)
+            def on_load(success):
+                if success and self.folder_choices: self.show_folder_selector()
+                elif not success: self.log("[错误] 自动载入失败，无法打开目录选择器。")
+                else: self.log("[错误] 无法载入文件夹列表。请检查目录树文件。")
+            self.load_tree_only(callback=on_load)
             return
 
-        # 2. 创建窗口
         win = tk.Toplevel(self.root)
         win.title("选择要生成的目录")
         win.geometry("750x550")
         
-        # --- 窗口布局 (三明治布局) ---
-
-        # 1. 底部按钮 (锚定)
-        bottom_frame = tk.Frame(win)
-        bottom_frame.pack(side='bottom', fill='x', pady=(5, 10))
+        bottom = tk.Frame(win)
+        bottom.pack(side='bottom', fill='x', pady=(5, 10))
+        btns = tk.Frame(bottom)
+        btns.pack()
         
-        inner_buttons_frame = tk.Frame(bottom_frame)
-        inner_buttons_frame.pack() # 居中
-        
-        btn_confirm = tk.Button(inner_buttons_frame, text="确认生成", width=12)
-        btn_confirm.pack(side='left', padx=10)
-        btn_cancel = tk.Button(inner_buttons_frame, text="取消", width=12, command=win.destroy)
-        btn_cancel.pack(side='left', padx=10)
+        tk.Button(btns, text="确认生成", width=12, command=lambda: confirm()).pack(side='left', padx=10)
+        tk.Button(btns, text="取消", width=12, command=win.destroy).pack(side='left', padx=10)
 
-        # 2. 顶部搜索框
+        # 搜索
         filter_frame = tk.LabelFrame(win, text="🔍 筛选目录", padx=10, pady=5)
         filter_frame.pack(side='top', fill='x', padx=10, pady=(10, 5)) 
-
         search_var = tk.StringVar()
-        search_entry = tk.Entry(filter_frame, textvariable=search_var, width=50)
-        search_entry.pack(side='left', fill='x', expand=True, padx=5)
+        tk.Entry(filter_frame, textvariable=search_var, width=50).pack(side='left', fill='x', expand=True, padx=5)
 
-        # 3. 中间列表 (填充剩余空间)
+        # 列表
         list_frame = tk.LabelFrame(win, text="📂 目录列表 (可多选)", padx=10, pady=10)
         list_frame.pack(side='top', fill='both', expand=True, padx=10, pady=5)
 
-        # 列表区的快速选择按钮
-        select_btn_frame = tk.Frame(list_frame)
-        select_btn_frame.pack(fill='x', pady=(0, 5))
-        tk.Button(select_btn_frame, text="全选", width=10, command=lambda: select_all(True)).pack(side='left', padx=5)
-        tk.Button(select_btn_frame, text="全不选", width=10, command=lambda: select_all(False)).pack(side='left', padx=5)
+        sel_btns = tk.Frame(list_frame)
+        sel_btns.pack(fill='x', pady=(0, 5))
+        tk.Button(sel_btns, text="全选", width=10, command=lambda: listbox.select_set(0, tk.END)).pack(side='left', padx=5)
+        tk.Button(sel_btns, text="全不选", width=10, command=lambda: listbox.select_clear(0, tk.END)).pack(side='left', padx=5)
 
-        # 列表
         scrollbar = tk.Scrollbar(list_frame, orient='vertical')
         listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, selectmode='extended', height=20)
         scrollbar.config(command=listbox.yview)
-
         scrollbar.pack(side='right', fill='y')
         listbox.pack(side='left', fill='both', expand=True)
 
-        # --- 窗口功能 ---
-        
         sorted_folders = sorted(list(self.folder_choices))
 
-        def display_folder_name(folder):
-            """将空字符串（根目录）显示为更友好的文本"""
-            return "[根目录]" if folder == "" else folder
-
-        def populate_listbox(items):
-            """填充列表，并选中已选的项目"""
+        def populate(items):
             listbox.delete(0, tk.END)
-            for i, folder in enumerate(items):
-                listbox.insert(tk.END, display_folder_name(folder))
-                if folder in self.selected_folders:
-                    listbox.select_set(i)
+            for i, f in enumerate(items):
+                listbox.insert(tk.END, "[根目录]" if f == "" else f)
+                if f in self.selected_folders: listbox.select_set(i)
 
-        def on_filter(*args):
-            """根据搜索框内容筛选列表"""
-            query = search_var.get().lower()
-            if not query:
-                populate_listbox(sorted_folders)
-            else:
-                filtered_items = [f for f in sorted_folders if query in f.lower() or (f == "" and query in "[根目录]")]
-                populate_listbox(filtered_items)
+        search_var.trace_add('write', lambda *args: populate([f for f in sorted_folders if search_var.get().lower() in f.lower()]))
         
-        search_var.trace_add('write', on_filter) # 绑定搜索事件
-        
-        def select_all(select_all_flag):
-            """全选或全不选"""
-            if select_all_flag:
-                listbox.select_set(0, tk.END)
-            else:
-                listbox.select_clear(0, tk.END)
-
-        def on_confirm():
-            selected_indices = listbox.curselection()
-            
-            # 获取实际的文件夹路径 (需要从 sorted_folders 中根据索引还原)
-            selected_folders_list = [listbox.get(i) for i in selected_indices]
-            # 还原 "[根目录]" 为 ""
-            selected_folders_actual = {f if f != "[根目录]" else "" for f in selected_folders_list}
-
-            if not selected_folders_actual:
+        def confirm():
+            sel = [listbox.get(i) for i in listbox.curselection()]
+            real = {f if f != "[根目录]" else "" for f in sel}
+            if not real:
                 self.log("[提示] 你没有选择任何目录。")
                 win.destroy()
                 return
-            
-            self.selected_folders = selected_folders_actual
-            
-            self.log(f"[选择] 已选择 {len(self.selected_folders)} 个目录准备生成。")
+            self.selected_folders = real
+            self.log(f"[选择] 已选择 {len(real)} 个目录准备生成。")
             win.destroy()
-            
             self.start_generation(mode='single') 
         
-        btn_confirm.config(command=on_confirm)
-        win.protocol("WM_DELETE_WINDOW", win.destroy) # 绑定窗口关闭事件
-        populate_listbox(sorted_folders)
-
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        populate(sorted_folders)
         win.transient(self.root)
         win.grab_set()
         self.root.wait_window(win)
 
-    # --- 核心逻辑：全量生成确认 ---
+    # 全量确认
     def confirm_and_start_full_generation(self):
-        """点击全量生成按钮后调用，负责确认"""
-        
-        # 检查缓存，如果为空则异步加载
         if not self.all_media_paths:
             self.log("[提示] 目录树未载入，正在尝试自动载入...")
-            
-            def on_load_complete(success):
-                if success and self.all_media_paths:
-                    self.confirm_and_start_full_generation() 
-                elif not success:
-                    self.log("[错误] 自动载入失败，无法全量生成。")
-                else:
-                    self.log("[错误] 目录树为空，请先载入文件。")
-                    self.root.after(0, lambda: self.status_var.set("❌ 目录树为空"))
-
-            self.load_tree_only(callback=on_load_complete)
+            self.load_tree_only(callback=lambda s: self.confirm_and_start_full_generation() if s else None)
             return
 
-        # 显示确认对话框
         message = (f"您确定要执行 **全量生成** 吗？\n\n"
-                    f"此操作将根据当前目录树文件 (共 {len(self.all_media_paths)} 个媒体文件) "
-                    f"在输出目录中重新生成所有 STRM 文件。\n"
-                    f"⚠️ 【警告】这会清除输出目录下旧的 STRM 索引并重新创建所有文件！")
+                   f"此操作将根据当前目录树文件 (共 {len(self.all_media_paths)} 个媒体文件) "
+                   f"在输出目录中重新生成所有 STRM 文件。\n"
+                   f"⚠️ 【警告】这会清除输出目录下旧的 STRM 索引并重新创建所有文件！")
         
         if messagebox.askyesno("全量生成确认", message):
             self.log("[确认] 用户已确认全量生成。")
@@ -592,8 +499,7 @@ class StrmGeneratorApp:
             self.log("[取消] 用户取消了全量生成操作。")
             self.root.after(0, lambda: self.status_var.set("✅ 全量生成已取消。"))
 
-
-    # --- 核心逻辑：生成 STRM (工作线程) ---
+    # 生成主逻辑
     def start_generation(self, mode='full'):
         self.last_mode = mode
         t = threading.Thread(target=self._worker_generate, args=(mode,))
@@ -601,7 +507,6 @@ class StrmGeneratorApp:
         t.start()
 
     def _worker_generate(self, mode):
-        # 使用锁防止并发生成
         if not self._is_loading.acquire(blocking=False):
             self.log("[错误] 无法开始生成：当前正在进行其他操作。请稍后再试。")
             self.root.after(0, lambda: self.status_var.set("❌ 操作冲突，请等待完成"))
@@ -611,7 +516,6 @@ class StrmGeneratorApp:
             self.root.after(0, lambda: self.status_var.set("🔄 处理中..."))
             self.log(f"开始 {mode} 模式生成 STRM 文件...")
             
-            # 收集参数
             input_path = self.path_var.get()
             prefix = self.prefix_var.get().rstrip('/')
             output_dir = self.output_var.get()
@@ -619,7 +523,6 @@ class StrmGeneratorApp:
             start_keyword = self.start_keyword_var.get().strip()
             encode_url = self.encode_var.get()
             
-            # --- 路径和前缀检查 ---
             if not input_path or not os.path.exists(input_path):
                 self.log("[错误] 目录树文件路径无效！")
                 self.root.after(0, lambda: self.status_var.set("❌ 目录树文件路径无效！"))
@@ -632,42 +535,23 @@ class StrmGeneratorApp:
                 self.log("[错误] STRM 输出目录为空！")
                 self.root.after(0, lambda: self.status_var.set("❌ STRM 输出目录为空！"))
                 return
-            os.makedirs(output_dir, exist_ok=True) # 确保输出目录存在
+            os.makedirs(output_dir, exist_ok=True)
 
-            # --- 检查缓存，如果为空则阻塞等待加载 ---
             if not self.all_media_paths:
                 self.log("[提示] 缓存为空，正在自动载入目录树...")
-                load_event = threading.Event()
-                
-                def load_wrapper():
-                    # 在主线程中执行
-                    def on_load_complete(success):
-                        if not success:
-                            self.log("[错误] _worker_generate 自动载入失败。")
-                        load_event.set() # 通知工作线程继续
-                    
-                    # 释放 _worker_generate 的锁，让 load_tree_only 能获取
+                evt = threading.Event()
+                def load_wrap():
+                    def cb(s):
+                        if not s: self.log("[错误] _worker_generate 自动载入失败。")
+                        evt.set()
                     self._is_loading.release()
-                    self.load_tree_only(callback=on_load_complete)
+                    self.load_tree_only(callback=cb)
+                self.root.after(0, load_wrap)
+                evt.wait()
+                if not self._is_loading.acquire(blocking=False): return
+                if not self.all_media_paths: return
 
-                self.root.after(0, load_wrapper)
-                load_event.wait() # 工作线程在此等待
-                
-                # 重新获取锁 (如果成功加载，则再次获取)
-                if not self._is_loading.acquire(blocking=False):
-                     # 如果无法重新获取锁，说明加载线程尚未完成，或者出现其他并发问题
-                     self.log("[错误] 无法重新获取锁，自动载入可能失败。")
-                     self.root.after(0, lambda: self.status_var.set("❌ 自动载入锁获取失败！"))
-                     return
-                
-                if not self.all_media_paths:
-                    self.log("[错误] 载入目录树失败或目录树为空。")
-                    self.root.after(0, lambda: self.status_var.set("❌ 目录树为空"))
-                    return
-
-            # --- 文件夹选择逻辑 ---
-            if mode == 'full' or mode == 'increment':
-                # 全量/增量模式处理所有解析到的文件夹
+            if mode in ['full', 'increment']:
                 self.selected_folders = self.folder_choices
                 if mode == 'full':
                      self.log(f"[模式] 全量模式：将处理全部 {len(self.folder_choices)} 个文件夹。")
@@ -683,196 +567,135 @@ class StrmGeneratorApp:
                 
             self.log(f"[过滤] 共有 {len(media_paths)} 个文件待处理...")
 
-            
-            files_to_generate = [] 
+            files_to_gen = [] 
             index_file = os.path.join(output_dir, '.strm_index.json')
             old_index = {}
-            new_index = {} # 当前目录树生成的完整索引
+            new_index = {} 
 
-            # --- 增量对比逻辑 ---
             if mode == "increment":
                 if os.path.exists(index_file):
                     try:
-                        with open(index_file, 'r', encoding='utf-8') as f:
-                            old_index = json.load(f)
+                        with open(index_file, 'r', encoding='utf-8') as f: old_index = json.load(f)
                         self.log(f"[索引] 成功载入旧索引，共 {len(old_index)} 项。")
                     except Exception as e:
                         self.log(f"[警告] 载入旧索引失败 ({e})，将视为全量操作。")
-                        old_index = {}
                 
-                # 生成当前目录树的完整索引
                 for path in media_paths:
                     fp = trim_path_by_keyword(path, start_keyword)
-                    new_index[fp] = path # 记录原始路径以供后续生成使用
+                    new_index[fp] = path 
 
-                # 对比找出新增和移除项
-                added_paths = [] 
-                for fp, original_path in new_index.items():
-                    # 如果标准化路径不在旧索引中，则认为是新增
-                    if fp not in old_index:
-                        added_paths.append(original_path) # added 列表使用原始路径
-                
-                removed_paths = [p for p in old_index.keys() if p not in new_index]
+                added = [path for fp, path in new_index.items() if fp not in old_index]
+                removed = [p for p in old_index.keys() if p not in new_index]
 
-                self.log(f"[对比] 新增: {len(added_paths)} 项, 移除: {len(removed_paths)} 项。")
+                self.log(f"[对比] 新增: {len(added)} 项, 移除: {len(removed)} 项。")
 
-                if added_paths or removed_paths:
-                    # 增量模式下，只生成新增的文件
-                    files_to_generate = self.preview_selection(added_paths, removed_paths)
+                if added or removed:
+                    files_to_gen = self.preview_selection(added, removed)
                 else:
                     self.log("[提示] 没有新增或删除项目，增量生成结束。")
                     self.root.after(0, lambda: self.status_var.set("✅ 增量生成完成，无需操作"))
-                    files_to_generate = [] 
 
-            # --- 选择目录/全量生成逻辑 ---
             elif mode == "single":
                 self.log("[模式] 选择目录生成，进行文件预览...")
-                files_to_generate = self.preview_selection(media_paths, [])
+                files_to_gen = self.preview_selection(media_paths, [])
             
             elif mode == "full":
                 self.log("[模式] 全量生成，跳过预览，直接处理所有文件...")
-                files_to_generate = media_paths 
+                files_to_gen = media_paths 
             
-            # --- 写入 STRM 文件 ---
             count = 0
-            if not files_to_generate:
+            if not files_to_gen:
                 self.log("[提示] 没有需要写入的文件。")
                 self.root.after(0, lambda: self.status_var.set("✅ 完成，无需写入。"))
                 return
                 
-            successful_writes_index = {}
-            index_lock = threading.Lock()
+            success_idx = {}
+            idx_lock = threading.Lock()
              
-            cpu_count = os.cpu_count() or 4
-            max_workers = min(64, max(4, cpu_count * 4))
+            max_workers = min(64, max(4, (os.cpu_count() or 4) * 4))
             self.log(f"[多线程] 启用 {max_workers} 个并发线程进行 STRM 写入...")
 
-            def write_strm(mp):
+            def write_task(mp):
                 try:
                     base = os.path.basename(mp)
-                    name_without_ext = os.path.splitext(base)[0]
+                    name_clean = re.sub(r'[\\/:*?"<>|]', '_', os.path.splitext(base)[0]).strip()
+                    if not name_clean: name_clean = f"invalid_{int(time.time())}"
+                    fname = name_clean + (ext if ext.startswith('.') else '.' + ext)
                     
-                    # 清理文件名中的非法字符
-                    safe_name = re.sub(r'[\\/:*?"<>|]', '_', name_without_ext)
-                    safe_name = safe_name.strip()
-                    if not safe_name:
-                        safe_name = f"__invalid_name_{int(time.time()*1000)}"
-
-                    file_name = safe_name + (ext if ext.startswith('.') else '.' + ext)
-                    trimmed_path = trim_path_by_keyword(mp, start_keyword)
+                    tpath = trim_path_by_keyword(mp, start_keyword)
+                    rel_dir = os.path.dirname(tpath).lstrip('/\\')
+                    target = os.path.join(output_dir, rel_dir) if rel_dir else output_dir
                     
-                    # 相对路径 (去除开头的 /)
-                    relative_dir = os.path.dirname(trimmed_path).lstrip('/\\')
-                    target_dir = os.path.join(output_dir, relative_dir) if relative_dir else output_dir
+                    os.makedirs(target, exist_ok=True)
                     
-                    # 再次确保输出目录存在 (防止并发冲突)
-                    os.makedirs(target_dir, exist_ok=True)
-                    
-                    # URL 编码：只对路径的每一部分进行编码，不编码分隔符 /
-                    trimmed_path_nix = trimmed_path.replace('\\', '/')
-                    # 去除开头的 /
-                    trimmed_path_nix_lstrip = trimmed_path_nix.lstrip('/') 
-                    url_path = trimmed_path_nix_lstrip
+                    url_part = tpath.replace('\\', '/').lstrip('/')
                     if encode_url:
-                        # 逐段编码 (保留 /)
-                        url_path_parts = (urllib.parse.quote(p) for p in trimmed_path_nix_lstrip.split('/'))
-                        url_path = '/'.join(url_path_parts)
+                        url_part = '/'.join(urllib.parse.quote(p) for p in url_part.split('/'))
                     
-                    # 组合最终 URL
-                    full_url = f"{prefix}/{url_path}"
-                    # 修正协议和路径之间的多余斜杠 (只保留协议后的两个// 或单个 /)
-                    full_url = re.sub(r'(?<!:)/{2,}', '/', full_url) 
+                    full_url = f"{prefix}/{url_part}"
+                    full_url = re.sub(r'(?<!:)/{2,}', '/', full_url)
                     
-                    output_path = os.path.join(target_dir, file_name)
-                    
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        f.write(full_url + '\n')
-                        
-                    # 返回成功结果和标准化路径 (用于索引)
-                    return f"[写入] {output_path} → {full_url}", 1, trimmed_path
+                    out_p = os.path.join(target, fname)
+                    with open(out_p, 'w', encoding='utf-8') as f: f.write(full_url + '\n')
+                    return f"[写入] {out_p} → {full_url}", 1, tpath
                 except Exception as e:
-                    # 返回失败结果和原始路径 (用于日志)
                     return f"[失败] 写入 {mp} 错误: {e}", 0, None
 
-            if files_to_generate:
-                total_to_generate = len(files_to_generate)
-                self.log(f"[写入] 准备写入 {total_to_generate} 个文件...")
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(write_strm, p): p for p in files_to_generate}
-                    for i, future in enumerate(as_completed(futures)):
-                        src = futures.get(future)
-                        try:
-                            result, ret, trimmed_path_or_none = future.result() 
-                            
-                            if ret == 1:
-                                count += 1
-                                # 成功写入的文件，将其标准化路径加入成功索引
-                                if trimmed_path_or_none:
-                                    with index_lock:
-                                        successful_writes_index[trimmed_path_or_none] = True
-                            else:
-                                self.log(result) # 打印失败日志
-                            
-                            # 更新状态栏 (不频繁，避免UI卡顿)
-                            if (i + 1) % 50 == 0 or (i + 1) == total_to_generate:
-                                self.root.after(0, lambda p=i+1: self.status_var.set(f"🔄 写入中... {p}/{total_to_generate} ({count} 成功)"))
+            total = len(files_to_gen)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(write_task, p): p for p in files_to_gen}
+                for i, fut in enumerate(as_completed(futures)):
+                    err, ret, key = fut.result()
+                    if ret:
+                        count += 1
+                        with idx_lock: success_idx[key] = True
+                    else:
+                        self.log(err)
+                    
+                    if (i+1) % 100 == 0 or (i+1) == total:
+                        self.root.after(0, lambda c=count, t=total: self.status_var.set(f"🔄 写入中... {c}/{t}"))
 
-                        except Exception as e:
-                            self.log(f"[线程异常] 处理 {src} 时报错: {e}")
-
-            # --- 最终索引保存 (所有模式均在此处执行) ---
             if mode == "full":
                 try:
-                    # 全量模式：只保存成功写入的索引
-                    self._backup_index_file(index_file) 
+                    self._backup_index_file(index_file)
                     with open(index_file, 'w', encoding='utf-8') as f:
-                        json.dump(successful_writes_index, f, ensure_ascii=False, indent=2)
-                    self.log(f"[索引] 全量模式：已为 {len(successful_writes_index)} 个【成功写入】的文件保存索引。")
+                        json.dump(success_idx, f, ensure_ascii=False, indent=2)
+                    self.log(f"[索引] 全量模式：已为 {len(success_idx)} 个【成功写入】的文件保存索引。")
                 except Exception as e:
                     self.log(f"[错误] 保存 'full' 模式索引失败: {e}")
 
-            elif mode == "single" or mode == "increment":
-                if successful_writes_index or removed_paths:
-                    # 加载旧索引 (如果是 increment，old_index 已加载；如果是 single，需要重新加载)
-                    current_index = {}
+            elif mode in ["single", "increment"]:
+                if success_idx or (mode == "increment" and removed):
+                    curr = {}
                     if os.path.exists(index_file):
                         try:
-                            with open(index_file, 'r', encoding='utf-8') as f:
-                                current_index = json.load(f)
-                        except Exception:
-                            pass
+                            with open(index_file, 'r', encoding='utf-8') as f: curr = json.load(f)
+                        except: pass
                     
-                    # 构造最终索引
-                    final_index = current_index.copy()
-
-                    # 1. 移除项 (仅对增量模式有意义)
+                    final = curr.copy()
                     if mode == "increment":
-                         for removed_path in removed_paths:
-                            if removed_path in final_index:
-                                del final_index[removed_path] 
-                                self.log(f"[清理] 已从索引中移除: {removed_path}")
-                                # 💡 额外：如果需要，可以在此删除对应的 STRM 文件
+                        for r in removed: 
+                            if r in final: 
+                                del final[r]
+                                self.log(f"[清理] 已从索引中移除: {r}")
+                    final.update(success_idx)
                     
-                    # 2. 添加成功写入的项 (无论 single 还是 increment)
-                    final_index.update(successful_writes_index)
-                    
-                    if final_index != current_index:
+                    if final != curr:
                         try:
-                            self._backup_index_file(index_file) # 备份旧索引
+                            self._backup_index_file(index_file)
                             with open(index_file, 'w', encoding='utf-8') as f:
-                                json.dump(final_index, f, ensure_ascii=False, indent=2)
+                                json.dump(final, f, ensure_ascii=False, indent=2)
                             
                             if mode == "increment":
-                                self.log(f"[索引] 增量模式：已【更新】全局索引 (新增 {len(successful_writes_index)} 项，移除 {len(removed_paths)} 项)。")
+                                self.log(f"[索引] 增量模式：已【更新】全局索引 (新增 {len(success_idx)} 项，移除 {len(removed)} 项)。")
                             else:
-                                self.log(f"[索引] 选择目录模式：已【增量更新】全局索引 (新增 {len(successful_writes_index)} 项)。")
+                                self.log(f"[索引] 选择目录模式：已【增量更新】全局索引 (新增 {len(success_idx)} 项)。")
                         except Exception as e:
                             self.log(f"[错误] 保存 '{mode}' 模式索引失败: {e}")
                     else:
                         self.log("[提示] 索引未发生变化，无需保存。")
                 else:
                     self.log(f"[提示] '{mode}' 模式完成。未写入文件，索引未更新。")
-            # --------------------
 
             self.log(f"[完成] 共生成 {count} 个 STRM 文件。")
             self.root.after(0, lambda: self.status_var.set(f"✅ 完成，生成 {count} 个文件。"))
@@ -883,135 +706,83 @@ class StrmGeneratorApp:
             self.log(traceback.format_exc())
             self.root.after(0, lambda: self.status_var.set("❌ 生成失败！"))
         finally:
-            # 确保锁在任何情况下都被释放
-            if self._is_loading.locked():
-                 self._is_loading.release()
+            if self._is_loading.locked(): self._is_loading.release()
 
-    # --- 核心逻辑：增量预览窗口 ---
+    # 预览弹窗
     def preview_selection(self, added, removed):
-        """
-        在工作线程中被调用，但会调度一个 Toplevel 窗口到主线程。
-        使用 Event 来阻塞工作线程，直到窗口关闭。
-        """
-        confirm_event = threading.Event()
-        # 初始值为 added，如果用户不操作，默认生成所有新增项
-        preview_result = {'to_generate': list(added)} 
+        evt = threading.Event()
+        res = {'gen': list(added)} 
 
-        def show_preview():
+        def show():
             win = tk.Toplevel(self.root)
             win.title("选择生成项")
             win.geometry("820x520")
 
             tk.Label(win, text=f"新增: {len(added)}  移除: {len(removed)}").pack(anchor='w', padx=10, pady=6)
             
-            # --- 窗口布局 (三明治布局) ---
-            
-            # 1. 底部按钮 (锚定)
             btn_frame = tk.Frame(win)
             btn_frame.pack(side='bottom', pady=6) 
+            btns = tk.Frame(btn_frame)
+            btns.pack()
 
-            # 1b. 按钮居中
-            inner_buttons_frame = tk.Frame(btn_frame)
-            inner_buttons_frame.pack() 
-
-            # 2. 删除区域 (锚定在按钮上方)
             if removed:
-                frame_del = tk.LabelFrame(win, text="已移除项（仅参考，这些 STRM 文件可能需要手动删除）", padx=6, pady=6)
-                frame_del.pack(side='bottom', fill='x', expand=False, padx=10, pady=6) 
-                del_txt = scrolledtext.ScrolledText(frame_del, width=96, height=8)
-                del_txt.pack(fill='both', expand=True)
-                for r in removed:
-                    # 显示的是标准化路径
-                    del_txt.insert(tk.END, f"{r}\n")
-                del_txt.configure(state='disabled')
+                f_del = tk.LabelFrame(win, text="已移除项（仅参考，这些 STRM 文件可能需要手动删除）", padx=6, pady=6)
+                f_del.pack(side='bottom', fill='x', expand=False, padx=10, pady=6)
+                txt = scrolledtext.ScrolledText(f_del, width=96, height=8)
+                txt.pack(fill='both', expand=True)
+                for r in removed: txt.insert(tk.END, f"{r}\n")
+                txt.configure(state='disabled')
 
-            # 3. 新增区域 (填充剩余空间)
-            frame_add = tk.LabelFrame(win, text="可选生成项 (勾选的项目将被生成，未勾选的项目下次增量会重试)", padx=6, pady=6)
-            frame_add.pack(fill='both', expand=True, padx=10, pady=6) 
+            f_add = tk.LabelFrame(win, text="可选生成项 (勾选的项目将被生成，未勾选的项目下次增量会重试)", padx=6, pady=6)
+            f_add.pack(fill='both', expand=True, padx=10, pady=6)
             
-            # --- Canvas 列表 ---
-            canvas_a = tk.Canvas(frame_add)
-            scrollbar_a = tk.Scrollbar(frame_add, orient="vertical", command=canvas_a.yview)
-            inner_a = tk.Frame(canvas_a)
+            cvs = tk.Canvas(f_add)
+            sb = tk.Scrollbar(f_add, orient="vertical", command=cvs.yview)
+            inn = tk.Frame(cvs)
             
-            def configure_scroll(event):
-                canvas_a.configure(scrollregion=canvas_a.bbox("all"))
-            inner_a.bind("<Configure>", configure_scroll)
-            
-            canvas_a.create_window((0,0), window=inner_a, anchor='nw')
-            canvas_a.configure(yscrollcommand=scrollbar_a.set)
-            
-            scrollbar_a.pack(side="right", fill="y")
-            canvas_a.pack(side="left", fill='both', expand=True)
+            inn.bind("<Configure>", lambda e: cvs.configure(scrollregion=cvs.bbox("all")))
+            cvs.create_window((0,0), window=inn, anchor='nw')
+            cvs.configure(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y")
+            cvs.pack(side="left", fill='both', expand=True)
 
-            # --- 窗口功能 ---
-            added_vars_map = {} 
-            
-            MAX_PREVIEW_ITEMS = 5000
-            if len(added) > MAX_PREVIEW_ITEMS:
-                tk.Label(inner_a, text=f"项目过多 ({len(added)} 个)，超过 {MAX_PREVIEW_ITEMS} 条预览限制。\n将默认全部生成。", fg='red').pack(pady=20)
-                # 默认值已经设置，无需修改
+            vars_map = {}
+            if len(added) > 5000:
+                tk.Label(inn, text=f"项目过多 ({len(added)} 个)，默认全部生成。", fg='red').pack(pady=20)
             else:
-                # 分块加载 Checkbutton 以防止UI冻结
-                def load_chunk(index=0):
-                    try:
-                        CHUNK_SIZE = 200 # 每次加载 200 个
-                        count = 0
-                        while count < CHUNK_SIZE and index < len(added):
-                            p = added[index]
-                            var = tk.BooleanVar(value=True) # 默认选中 (即默认生成)
-                            cb = tk.Checkbutton(inner_a, text=p, variable=var, anchor='w')
-                            cb.pack(anchor='w', fill='x')
-                            added_vars_map[p] = var
-                            count += 1
-                            index += 1
-                        
-                        if index < len(added):
-                            win.after(1, lambda: load_chunk(index))
-                    except tk.TclError:
-                        # 窗口在加载过程中被关闭
-                        pass
-                
-                load_chunk(0) # 开始加载
+                def loader(idx=0):
+                    cnt = 0
+                    while cnt < 200 and idx < len(added):
+                        p = added[idx]
+                        v = tk.BooleanVar(value=True)
+                        tk.Checkbutton(inn, text=p, variable=v, anchor='w').pack(anchor='w', fill='x')
+                        vars_map[p] = v
+                        cnt += 1; idx += 1
+                    if idx < len(added): win.after(1, lambda: loader(idx))
+                loader(0)
 
-            # 按钮回调
-            def on_confirm():
-                if len(added) <= MAX_PREVIEW_ITEMS:
-                    # 只有在显示了 CheckButton 时，才根据勾选状态来确定 to_generate 列表
-                    preview_result['to_generate'] = [p for p,var in added_vars_map.items() if var.get()]
-                # 否则，to_generate 保持默认值 added (全部生成)
+            def ok():
+                if len(added) <= 5000:
+                    res['gen'] = [p for p,v in vars_map.items() if v.get()]
+                win.destroy(); evt.set()
                 
-                win.destroy()
-                confirm_event.set()
+            def cancel():
+                res['gen'] = []; win.destroy(); evt.set()
                 
-            def on_cancel():
-                preview_result['to_generate'] = []
-                win.destroy()
-                confirm_event.set()
-                
-            # 添加按钮到居中框架
-            tk.Button(inner_buttons_frame, text="确认生成所选项", command=on_confirm).pack(side='left', padx=8)
-            tk.Button(inner_buttons_frame, text="取消（不生成）", command=on_cancel).pack(side='left', padx=8)
+            tk.Button(btns, text="确认生成所选项", command=ok).pack(side='left', padx=8)
+            tk.Button(btns, text="取消（不生成）", command=cancel).pack(side='left', padx=8)
 
-            win.protocol("WM_DELETE_WINDOW", on_cancel) # 绑定窗口关闭事件
+            win.protocol("WM_DELETE_WINDOW", cancel)
             win.transient(self.root)
             win.grab_set()
             self.root.wait_window(win)
-            
-            if not confirm_event.is_set():
-                 preview_result['to_generate'] = []
-                 confirm_event.set()
+            if not evt.is_set(): res['gen'] = []; evt.set()
 
-        self.root.after(0, show_preview)
-        confirm_event.wait() 
-        return preview_result.get('to_generate', [])
-
-def main():
-    # 确保使用 TkinterDnD.Tk() 来支持文件拖放
-    root = TkinterDnD.Tk()
-    app = StrmGeneratorApp(root)
-    root.mainloop()
+        self.root.after(0, show)
+        evt.wait()
+        return res['gen']
 
 if __name__ == "__main__":
-    main()
-
+    root = TkinterDnD.Tk()
+    StrmGeneratorApp(root)
+    root.mainloop()
